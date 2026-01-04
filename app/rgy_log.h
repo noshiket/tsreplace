@@ -37,9 +37,13 @@
 
 //NVEnc.auo/QSVEnc.auoビルド時、/clrでは<thread>は使用できませんなどと出るので、
 //前方宣言で回避する
+#if defined(_WIN32) || defined(_WIN64)
 namespace std {
     class mutex;
 }
+#else
+#include <mutex>
+#endif
 
 enum RGYLogLevel {
     RGY_LOG_TRACE = -3,

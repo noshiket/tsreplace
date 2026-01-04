@@ -6,6 +6,47 @@ tsの映像部分のみの置き換えを行い、サイズの圧縮を図るツ
 
 <img src="./data/tsreplace_concept.webp" width="800px">
 
+## このフォークについて
+
+このフォークでは、オリジナル版に以下の修正・機能追加を行っています：
+
+### 新機能
+
+#### 映像+音声の自動置き換え (`--replace-av` / `-av`)
+映像と音声を含むファイルから、すべての音声ストリームを自動検出して置き換えます。
+
+```bash
+tsreplace -i input.ts --replace-av video_audio.mp4 -o output.ts
+```
+
+**特徴**:
+- 主音声・副音声の自動検出（最大2トラック対応）
+- 対応音声コーデック: AAC, MP2/MP3
+- 従来の `-r` オプションとの併用不可
+
+### macOS対応
+- macOSでのビルドと動作をサポート
+- プラットフォーム固有のシステムコールに対応
+  - メモリ情報取得 (`sysctl`, `mach_host_host`)
+  - ファイルタイムスタンプ (`st_atimespec`, `st_mtimespec`)
+  - スレッドID取得 (`pthread_threadid_np`)
+  - スレッド生存確認 (`pthread_kill`)
+- 型名の衝突回避 (`processor_info_t` → `rgy_processor_info_t`)
+- ビルドシステムの改善
+  - macOS/Linux自動判定
+  - プラットフォーム別リンカオプション設定
+  - `iconv`ライブラリの自動リンク (macOS)
+
+### ビルド方法 (macOS/Linux)
+```bash
+./configure
+make
+```
+
+生成される実行ファイル: `tsreplace`
+
+---
+
 ## 目次 <!-- omit in toc -->
 - [想定動作環境](#想定動作環境)
 - [基本的な使用方法](#基本的な使用方法)

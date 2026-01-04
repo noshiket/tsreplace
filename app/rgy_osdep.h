@@ -308,7 +308,13 @@ static uint32_t GetCurrentProcessId() {
 }
 
 static uint32_t GetCurrentThreadId() {
+#ifdef __APPLE__
+    uint64_t tid;
+    pthread_threadid_np(NULL, &tid);
+    return (uint32_t)tid;
+#else
     return (uint32_t)pthread_self();
+#endif
 }
 
 static pid_t GetCurrentProcess() {
@@ -320,6 +326,10 @@ static pthread_t GetCurrentThread() {
 }
 
 static size_t SetProcessAffinityMask(pid_t process, size_t mask) {
+#ifdef __APPLE__
+    // macOS does not support process affinity, return unchanged mask
+    return mask;
+#else
     cpu_set_t cpuset_org;
     CPU_ZERO(&cpuset_org);
     sched_getaffinity(process, sizeof(cpu_set_t), &cpuset_org);
@@ -338,9 +348,14 @@ static size_t SetProcessAffinityMask(pid_t process, size_t mask) {
     }
     sched_setaffinity(process, sizeof(cpu_set_t), &cpuset);
     return mask_org;
+#endif
 }
 
 static size_t SetThreadAffinityMask(pthread_t thread, size_t mask) {
+#ifdef __APPLE__
+    // macOS does not support thread affinity, return unchanged mask
+    return mask;
+#else
     cpu_set_t cpuset_org;
     CPU_ZERO(&cpuset_org);
     pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset_org);
@@ -359,10 +374,16 @@ static size_t SetThreadAffinityMask(pthread_t thread, size_t mask) {
     }
     pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
     return mask_org;
+#endif
 }
 
 static bool RGYThreadStillActive(pthread_t thread) {
+#ifdef __APPLE__
+    // macOS does not have pthread_tryjoin_np, use pthread_kill with signal 0
+    return pthread_kill(thread, 0) == 0;
+#else
     return pthread_tryjoin_np(thread, nullptr) != 0;
+#endif
 }
 
 static bool RGYProcessExists(uint32_t pid) {

@@ -534,8 +534,8 @@ bool get_cpu_info(cpu_info_t *cpu_info) {
     std::string script_data = std::string(data_begin, data_end);
     inputFile.close();
 
-    std::vector<processor_info_t> processor_list;
-    processor_info_t info = { 0 };
+    std::vector<rgy_processor_info_t> processor_list;
+    rgy_processor_info_t info = { 0 };
     info.processor_id = info.core_id = info.socket_id = -1;
 
     for (auto line : split(script_data, "\n")) {
@@ -579,7 +579,7 @@ bool get_cpu_info(cpu_info_t *cpu_info) {
     //ここまでで論理コアの情報を作った
     //cpu_infoに登録するのは物理コアの情報なので、整理しなおす
     //いったんsocket→core→processorの順でソート
-    std::sort(processor_list.begin(), processor_list.end(), [](const processor_info_t& a, const processor_info_t& b) {
+    std::sort(processor_list.begin(), processor_list.end(), [](const rgy_processor_info_t& a, const rgy_processor_info_t& b) {
         if (a.socket_id != b.socket_id) return a.socket_id < b.socket_id;
         if (a.core_id != b.core_id) return a.core_id < b.core_id;
         return a.processor_id < b.processor_id;
@@ -589,7 +589,7 @@ bool get_cpu_info(cpu_info_t *cpu_info) {
     cpu_info->physical_cores = 0;
     cpu_info->logical_cores = processor_list.size();
 
-    processor_info_t *prevCore = nullptr;
+    rgy_processor_info_t *prevCore = nullptr;
     for (size_t ip = 0; ip < processor_list.size(); ip++) {
         if (prevCore != nullptr
             && prevCore->socket_id == processor_list[ip].socket_id
@@ -743,7 +743,7 @@ bool get_cpu_info(cpu_info_t *cpu_info) {
 #endif //#if defined(_WIN32) || defined(_WIN64)
 
 
-const processor_info_t *get_core_info(const cpu_info_t *cpu_info, RGYCoreType type, int id) {
+const rgy_processor_info_t *get_core_info(const cpu_info_t *cpu_info, RGYCoreType type, int id) {
     switch (type) {
     case RGYCoreType::Physical: return (id < cpu_info->physical_cores) ? &cpu_info->proc_list[id] : nullptr;
     case RGYCoreType::Logical: {

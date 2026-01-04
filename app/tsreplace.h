@@ -41,6 +41,7 @@ enum class TSRReplaceStartPoint {
     KeyframPts,
     FirstFrame,
     FirstPacket,
+    Auto,
 };
 
 static const CX_DESC list_startpoint[] = {
@@ -115,9 +116,26 @@ struct AVDemuxVideo {
     void close();
 };
 
+struct AVDemuxAudio {
+    bool                      readAudio;
+    AVStream                 *stream;
+    int                       index;
+    int64_t                   streamFirstPts;
+    AVPacket                 *firstPkt;
+    int                       streamPtsInvalid;
+    uint8_t                  *extradata;
+    int                       extradataSize;
+
+    AVDemuxAudio();
+    ~AVDemuxAudio();
+    void close();
+};
+
 struct AVDemuxer {
     AVDemuxFormat format;
     AVDemuxVideo  video;
+    AVDemuxAudio  audio0;
+    AVDemuxAudio  audio1;
 
     AVDemuxer();
     ~AVDemuxer();
@@ -132,6 +150,8 @@ public:
     RGY_ERR initAVReader(const tstring& videofile, RGYQueueBuffer *inputQueue, const tstring& inputFormat, const int vidStreamID);
     std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> getSample();
     RGYTSStreamType getVideoStreamType() const;
+    RGYTSStreamType getAudioStreamType() const;
+    uint8_t getAudioStreamID(int streamIndex = 0) const;
 
     const uint8_t *getExtraData(int& size) const;
     const AVCodecParameters *getVidCodecPar() const;
@@ -196,6 +216,7 @@ protected:
 struct TSRReplaceParams {
     tstring input;
     tstring replacefile;
+    tstring replaceav; // 映像+音声を含むファイル（複数音声自動検出）
     tstring replacefileformat;
     tstring output;
     tstring logfile;
@@ -246,8 +267,12 @@ protected:
     RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result);
     RGY_ERR writeReplacedVideo();
     RGY_ERR writeReplacedVideo(AVPacket *pkt);
+    RGY_ERR writeReplacedAudio();
+    RGY_ERR writeReplacedAudio(AVPacket *pkt, const uint8_t audStreamID, const uint16_t audPID, uint8_t& counter, const int64_t firstKeyPts, const AVRational& timebase, const int64_t firstTimestamp, const AVCodecParameters *codecpar);
+    RGY_ERR writeReplacedAudio1();
     int64_t getOrigPtsOffset();
     void pushPESPTS(std::vector<uint8_t>& buf, const int64_t pts, const uint8_t top4bit);
+    bool addADTSHeader(std::vector<uint8_t>& output, const AVPacket *pkt, const AVCodecParameters *codecpar);
     bool isFirstNalAud(const bool isHEVC, const uint8_t *ptr, const size_t size);
     uint8_t getvideoDecCtrlEncodeFormat(const int height);
     uint8_t getAudValue(const AVPacket *pkt) const;
@@ -314,9 +339,17 @@ protected:
     std::vector<uint8_t> m_lastPat; // 直前の出力PATデータ
     std::vector<uint8_t> m_lastPmt; // 直前の出力PMTデータ
     std::unique_ptr<TSReplaceVideo> m_videoReplace; // 置き換え対象の動画の読み込み用
+    std::unique_ptr<TSReplaceVideo> m_audioReplace; // 置き換え対象の第1音声の読み込み用
+    std::unique_ptr<TSReplaceVideo> m_audio1Replace; // 置き換え対象の第2音声の読み込み用
     uint8_t m_patCounter; // 出力PATのカウンタ
     uint8_t m_pmtCounter; // 出力PMTのカウンタ
     uint8_t m_vidCounter; // 出力映像のカウンタ
+    uint8_t m_audCounter; // 出力第1音声のカウンタ
+    uint8_t m_aud1Counter; // 出力第2音声のカウンタ
+    uint16_t m_audPIDReplace; // 出力tsの第1音声のPID
+    uint16_t m_aud1PIDReplace; // 出力tsの第2音声のPID
+    int64_t m_audFirstPTS; // 第1音声の最初のPTS
+    int64_t m_aud1FirstPTS; // 第2音声の最初のPTS
     int64_t m_ptswrapOffset; // PCR wrapの加算分
     bool m_addAud; // audの挿入
     bool m_addHeaders; // ヘッダの挿入

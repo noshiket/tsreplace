@@ -141,19 +141,49 @@ void AVDemuxVideo::close() {
     }
 }
 
-AVDemuxer::AVDemuxer() : format(), video() {};
+AVDemuxAudio::AVDemuxAudio() :
+    readAudio(false),
+    stream(nullptr),
+    index(-1),
+    streamFirstPts(AV_NOPTS_VALUE),
+    firstPkt(nullptr),
+    streamPtsInvalid(0),
+    extradata(nullptr),
+    extradataSize(0) {
+
+}
+
+AVDemuxAudio::~AVDemuxAudio() {
+    close();
+}
+
+void AVDemuxAudio::close() {
+    if (firstPkt) {
+        av_packet_unref(firstPkt);
+        firstPkt = nullptr;
+    }
+    if (extradata) {
+        av_free(extradata);
+        extradata = nullptr;
+    }
+}
+
+AVDemuxer::AVDemuxer() : format(), video(), audio0(), audio1() {};
 
 AVDemuxer::~AVDemuxer() {
     close();
 }
 void AVDemuxer::close() {
     video.close();
+    audio0.close();
+    audio1.close();
     format.close();
 }
 
 TSRReplaceParams::TSRReplaceParams() :
     input(),
     replacefile(),
+    replaceav(),
     replacefileformat(),
     output(),
     logfile(),
@@ -435,6 +465,38 @@ RGYTSStreamType TSReplaceVideo::getVideoStreamType() const {
     return RGYTSStreamType::UNKNOWN;
 }
 
+RGYTSStreamType TSReplaceVideo::getAudioStreamType() const {
+    if (m_Demux.video.stream) {
+        switch (m_Demux.video.stream->codecpar->codec_id) {
+        case AV_CODEC_ID_MP2:
+        case AV_CODEC_ID_MP3:
+            return RGYTSStreamType::MPEG2_AUDIO;
+        case AV_CODEC_ID_AAC:
+        case AV_CODEC_ID_AAC_LATM:
+            return RGYTSStreamType::ADTS_TRANSPORT;
+        default:
+            return RGYTSStreamType::UNKNOWN;
+        }
+    }
+    return RGYTSStreamType::UNKNOWN;
+}
+
+uint8_t TSReplaceVideo::getAudioStreamID(int streamIndex) const {
+    if (m_Demux.video.stream) {
+        switch (m_Demux.video.stream->codecpar->codec_id) {
+        case AV_CODEC_ID_MP2:
+        case AV_CODEC_ID_MP3:
+            return 0xc0 + streamIndex; // MPEG-1/2 Audio (0xc0-0xdf)
+        case AV_CODEC_ID_AAC:
+        case AV_CODEC_ID_AAC_LATM:
+            return 0xc0 + streamIndex; // AAC also uses 0xc0+ in MPEG-2 TS
+        default:
+            return 0xbd; // Private stream 1 (for other audio types)
+        }
+    }
+    return 0xc0 + streamIndex;
+}
+
 RGY_ERR TSReplaceVideo::initAVReader(const tstring& videofile, RGYQueueBuffer *inputQueue, const tstring& inputFormat, const int vidStreamID) {
     if (!check_avcodec_dll()) {
         AddMessage(RGY_LOG_ERROR, error_mes_avcodec_dll_not_found());
@@ -523,53 +585,87 @@ RGY_ERR TSReplaceVideo::initAVReader(const tstring& videofile, RGYQueueBuffer *i
     //dump_format(dec.m_Demux.format.formatCtx, 0, argv[1], 0);
 
 
-    //動画ストリームを探す
-    //動画ストリームは動画を処理しなかったとしても同期のため必要
-    auto videoStreams = getAVReaderStreamIndex(AVMEDIA_TYPE_VIDEO);
-    if (videoStreams.size() == 0) {
-        AddMessage(RGY_LOG_ERROR, _T("error finding video stream.\n"));
-        return RGY_ERR_INVALID_DATA_TYPE;
-    }
+    //ストリームを探す（動画または音声）
+    //vidStreamID == 0xc0 or 0xc1の場合は音声ストリーム（MP4等の音声ファイルは最初の音声ストリームを使う）
+    const bool isAudioStream = (vidStreamID == 0xc0 || vidStreamID == 0xc1);
 
-    m_Demux.video.index = videoStreams.front();
-    if (vidStreamID) {
-        const auto streamIndexFound = std::find_if(videoStreams.begin(), videoStreams.end(), [formatCtx = m_Demux.format.formatCtx.get(), nSearchId = vidStreamID](int nStreamIndex) {
-            return (formatCtx->streams[nStreamIndex]->id == nSearchId);
-            });
-        if (streamIndexFound == videoStreams.end()) {
-            AddMessage(RGY_LOG_ERROR, _T("stream id %d (0x%x) not found in video tracks.\n"), vidStreamID, vidStreamID);
-            return RGY_ERR_INVALID_VIDEO_PARAM;
+    if (isAudioStream) {
+        //音声ストリームを探す
+        auto audioStreams = getAVReaderStreamIndex(AVMEDIA_TYPE_AUDIO);
+        if (audioStreams.size() == 0) {
+            AddMessage(RGY_LOG_ERROR, _T("error finding audio stream.\n"));
+            return RGY_ERR_INVALID_DATA_TYPE;
         }
-        m_Demux.video.index = *streamIndexFound;
-    }
-    m_Demux.video.stream = m_Demux.format.formatCtx->streams[m_Demux.video.index];
-    AddMessage(RGY_LOG_INFO, _T("Opened video stream #%d (ID %d (0x%x)), %s, %dx%d (%s), stream time_base %d/%d.\n"),
-        m_Demux.video.stream->index, m_Demux.video.stream->id, m_Demux.video.stream->id,
-        char_to_tstring(avcodec_get_name(m_Demux.video.stream->codecpar->codec_id)).c_str(),
-        m_Demux.video.stream->codecpar->width, m_Demux.video.stream->codecpar->height,
-        char_to_tstring(av_pix_fmt_desc_get((AVPixelFormat)m_Demux.video.stream->codecpar->format)->name).c_str(),
-        m_Demux.video.stream->time_base.num, m_Demux.video.stream->time_base.den);
 
-    //必要ならbitstream filterを初期化
-    if (m_Demux.video.stream->codecpar->extradata && m_Demux.video.stream->codecpar->extradata[0] == 1) {
-        RGY_ERR sts = initVideoBsfs();
+        //音声ファイルの場合はvidStreamIDに応じて音声ストリームを選択
+        //（MP4/M4A等の音声ファイルはMPEG-2 TSのようなstream idを持たないため）
+        //0xc0 → 1番目の音声（index 0）
+        //0xc1 → 2番目の音声（index 1）
+        const int audioIndex = (vidStreamID == 0xc1) ? 1 : 0;
+        if (audioIndex >= (int)audioStreams.size()) {
+            AddMessage(RGY_LOG_ERROR, _T("audio stream index %d not found (only %d audio stream(s) available).\n"),
+                audioIndex, (int)audioStreams.size());
+            return RGY_ERR_INVALID_DATA_TYPE;
+        }
+
+        m_Demux.video.index = audioStreams[audioIndex];
+        m_Demux.video.stream = m_Demux.format.formatCtx->streams[m_Demux.video.index];
+        AddMessage(RGY_LOG_INFO, _T("Opened audio stream #%d (ID %d (0x%x)), %s, %d Hz, stream time_base %d/%d.\n"),
+            m_Demux.video.stream->index, m_Demux.video.stream->id, m_Demux.video.stream->id,
+            char_to_tstring(avcodec_get_name(m_Demux.video.stream->codecpar->codec_id)).c_str(),
+            m_Demux.video.stream->codecpar->sample_rate,
+            m_Demux.video.stream->time_base.num, m_Demux.video.stream->time_base.den);
+
+        //音声の場合はヘッダーとパーサーの初期化はスキップ
+    } else {
+        //動画ストリームを探す
+        //動画ストリームは動画を処理しなかったとしても同期のため必要
+        auto videoStreams = getAVReaderStreamIndex(AVMEDIA_TYPE_VIDEO);
+        if (videoStreams.size() == 0) {
+            AddMessage(RGY_LOG_ERROR, _T("error finding video stream.\n"));
+            return RGY_ERR_INVALID_DATA_TYPE;
+        }
+
+        m_Demux.video.index = videoStreams.front();
+        if (vidStreamID) {
+            const auto streamIndexFound = std::find_if(videoStreams.begin(), videoStreams.end(), [formatCtx = m_Demux.format.formatCtx.get(), nSearchId = vidStreamID](int nStreamIndex) {
+                return (formatCtx->streams[nStreamIndex]->id == nSearchId);
+                });
+            if (streamIndexFound == videoStreams.end()) {
+                AddMessage(RGY_LOG_ERROR, _T("stream id %d (0x%x) not found in video tracks.\n"), vidStreamID, vidStreamID);
+                return RGY_ERR_INVALID_VIDEO_PARAM;
+            }
+            m_Demux.video.index = *streamIndexFound;
+        }
+        m_Demux.video.stream = m_Demux.format.formatCtx->streams[m_Demux.video.index];
+        AddMessage(RGY_LOG_INFO, _T("Opened video stream #%d (ID %d (0x%x)), %s, %dx%d (%s), stream time_base %d/%d.\n"),
+            m_Demux.video.stream->index, m_Demux.video.stream->id, m_Demux.video.stream->id,
+            char_to_tstring(avcodec_get_name(m_Demux.video.stream->codecpar->codec_id)).c_str(),
+            m_Demux.video.stream->codecpar->width, m_Demux.video.stream->codecpar->height,
+            char_to_tstring(av_pix_fmt_desc_get((AVPixelFormat)m_Demux.video.stream->codecpar->format)->name).c_str(),
+            m_Demux.video.stream->time_base.num, m_Demux.video.stream->time_base.den);
+
+        //必要ならbitstream filterを初期化
+        if (m_Demux.video.stream->codecpar->extradata && m_Demux.video.stream->codecpar->extradata[0] == 1) {
+            RGY_ERR sts = initVideoBsfs();
+            if (sts != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to init bsfs.\n"));
+                return sts;
+            }
+        }
+
+        //ヘッダーの取得を確認する
+        RGY_ERR sts = GetHeader();
         if (sts != RGY_ERR_NONE) {
-            AddMessage(RGY_LOG_ERROR, _T("failed to init bsfs.\n"));
+            AddMessage(RGY_LOG_ERROR, _T("failed to get header: extradata size = %d.\n"), m_Demux.video.stream->codecpar->extradata_size);
             return sts;
         }
-    }
 
-    //ヘッダーの取得を確認する
-    RGY_ERR sts = GetHeader();
-    if (sts != RGY_ERR_NONE) {
-        AddMessage(RGY_LOG_ERROR, _T("failed to get header: extradata size = %d.\n"), m_Demux.video.stream->codecpar->extradata_size);
-        return sts;
-    }
-
-    sts = initVideoParser();
-    if (sts != RGY_ERR_NONE) {
-        AddMessage(RGY_LOG_ERROR, _T("failed to init parser.\n"));
-        return sts;
+        sts = initVideoParser();
+        if (sts != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("failed to init parser.\n"));
+            return sts;
+        }
     }
 
     m_firstPTSFrame = TIMESTAMP_INVALID_VALUE;
@@ -987,6 +1083,10 @@ TSReplace::TSReplace() :
     m_preAnalysisFin(false),
     m_vidPIDReplace(0x0100),
     m_pcrPIDReplace(0),
+    m_audPIDReplace(0),
+    m_aud1PIDReplace(0),
+    m_audFirstPTS(TIMESTAMP_INVALID_VALUE),
+    m_aud1FirstPTS(TIMESTAMP_INVALID_VALUE),
     m_vidDTSOutMax(TIMESTAMP_INVALID_VALUE),
     m_vidPTS(TIMESTAMP_INVALID_VALUE),
     m_vidDTS(TIMESTAMP_INVALID_VALUE),
@@ -999,9 +1099,13 @@ TSReplace::TSReplace() :
     m_lastPat(),
     m_lastPmt(),
     m_videoReplace(),
+    m_audioReplace(),
+    m_audio1Replace(),
     m_patCounter(0),
     m_pmtCounter(0),
     m_vidCounter(0),
+    m_audCounter(0),
+    m_aud1Counter(0),
     m_ptswrapOffset(0),
     m_addAud(true),
     m_addHeaders(true),
@@ -1183,7 +1287,52 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_demuxer->init(log, m_selectService);
 
     m_replaceFileFormat = prms.replacefileformat;
-    if (prms.replacefile.length() > 0) {
+
+    // -av オプション: 映像と音声を含むファイルから自動検出
+    if (prms.replaceav.length() > 0) {
+        // 映像ストリームを初期化
+        m_videoReplace = std::make_unique<TSReplaceVideo>(log);
+        if (auto sts = m_videoReplace->initAVReader(prms.replaceav, nullptr, prms.replacefileformat, 0); sts != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("failed to open av file \"%s\".\n"), prms.replaceav.c_str());
+            return sts;
+        }
+
+        const auto streamID = m_videoReplace->getVideoStreamType();
+        if (streamID == RGYTSStreamType::UNKNOWN) {
+            AddMessage(RGY_LOG_ERROR, _T("Unsupported codec %s.\n"), char_to_tstring(avcodec_get_name(m_videoReplace->getVidCodecID())).c_str());
+            return RGY_ERR_INVALID_CODEC;
+        }
+
+        // 音声ストリームを自動検出
+        auto audioStreams = m_videoReplace->getAVReaderStreamIndex(AVMEDIA_TYPE_AUDIO);
+        AddMessage(RGY_LOG_INFO, _T("Detected %d audio stream(s) in \"%s\".\n"), (int)audioStreams.size(), prms.replaceav.c_str());
+
+        if (audioStreams.size() > 0) {
+            // 第1音声（主音声）
+            m_audioReplace = std::make_unique<TSReplaceVideo>(log);
+            if (auto sts = m_audioReplace->initAVReader(prms.replaceav, nullptr, prms.replacefileformat, 0xc0); sts != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to open audio stream 0 from \"%s\".\n"), prms.replaceav.c_str());
+                return sts;
+            }
+            AddMessage(RGY_LOG_INFO, _T("Audio stream 0 (main): %s\n"),
+                char_to_tstring(avcodec_get_name(m_audioReplace->getVidCodecPar()->codec_id)).c_str());
+        }
+
+        if (audioStreams.size() > 1) {
+            // 第2音声（副音声）
+            m_audio1Replace = std::make_unique<TSReplaceVideo>(log);
+            if (auto sts = m_audio1Replace->initAVReader(prms.replaceav, nullptr, prms.replacefileformat, 0xc1); sts != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to open audio stream 1 from \"%s\".\n"), prms.replaceav.c_str());
+                return sts;
+            }
+            AddMessage(RGY_LOG_INFO, _T("Audio stream 1 (sub): %s\n"),
+                char_to_tstring(avcodec_get_name(m_audio1Replace->getVidCodecPar()->codec_id)).c_str());
+        }
+
+        if (audioStreams.size() > 2) {
+            AddMessage(RGY_LOG_WARN, _T("File contains %d audio streams, but only the first 2 will be used.\n"), (int)audioStreams.size());
+        }
+    } else if (prms.replacefile.length() > 0) {
         m_videoReplace = std::make_unique<TSReplaceVideo>(log);
         if (auto sts = m_videoReplace->initAVReader(prms.replacefile, nullptr, prms.replacefileformat, 0); sts != RGY_ERR_NONE) {
             return sts;
@@ -1321,6 +1470,11 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
 }
 
 RGY_ERR TSReplace::writePacket(const RGYTSPacket *pkt) {
+    static int64_t s_packet_count = 0;
+    s_packet_count++;
+    if (s_packet_count % 1000000 == 0) {
+        fprintf(stderr, "DEBUG: Total packets written: %lld\n", (long long)s_packet_count);
+    }
     if (_fwrite_nolock(pkt->data(), 1, pkt->datasize(), m_fpTSOut.get()) != pkt->datasize()) {
         return RGY_ERR_OUT_OF_RESOURCES;
     }
@@ -1444,7 +1598,7 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
         const auto streamType = (RGYTSStreamType)table[pos];
         const int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
         const int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
-        
+
         if (streamType == RGYTSStreamType::H262_VIDEO) {
             buf.push_back((uint8_t)m_videoReplace->getVideoStreamType());     // stream typeの上書き
             buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
@@ -1454,6 +1608,14 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
             buf.push_back(0x01);
             buf.push_back(0x00);
+        } else if (m_audioReplace && esPid == m_audPIDReplace) {
+            // 第1音声の置き換え
+            buf.push_back((uint8_t)m_audioReplace->getAudioStreamType());     // stream typeの上書き
+            buf.insert(buf.end(), table + pos + 1, table + pos + 5 + esInfoLength);
+        } else if (m_audio1Replace && esPid == m_aud1PIDReplace) {
+            // 第2音声の置き換え
+            buf.push_back((uint8_t)m_audio1Replace->getAudioStreamType());    // stream typeの上書き
+            buf.insert(buf.end(), table + pos + 1, table + pos + 5 + esInfoLength);
         } else if (m_removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
         } else {
@@ -1505,6 +1667,99 @@ void TSReplace::pushPESPTS(std::vector<uint8_t>& buf, const int64_t pts, const u
     buf.push_back((uint8_t)(a & 0xff));
     buf.push_back((uint8_t)(b >> 8));
     buf.push_back((uint8_t)(b & 0xff));
+}
+
+bool TSReplace::addADTSHeader(std::vector<uint8_t>& output, const AVPacket *pkt, const AVCodecParameters *codecpar) {
+    // ADTSヘッダーがすでに存在するかチェック（0xFFF syncword）
+    if (pkt->size >= 7 && (pkt->data[0] == 0xFF) && ((pkt->data[1] & 0xF0) == 0xF0)) {
+        // すでにADTSヘッダーがある場合はそのままコピー
+        output.insert(output.end(), pkt->data, pkt->data + pkt->size);
+        return true;
+    }
+
+    // MP4からのAAC（ADTSヘッダーなし）の場合、ADTSヘッダーを追加
+    if (codecpar->codec_id != AV_CODEC_ID_AAC && codecpar->codec_id != AV_CODEC_ID_AAC_LATM) {
+        // AAC以外の場合はそのままコピー
+        output.insert(output.end(), pkt->data, pkt->data + pkt->size);
+        return true;
+    }
+
+    // サンプリングレートインデックスを取得
+    static const int sampling_rates[] = {
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+        16000, 12000, 11025, 8000, 7350, 0, 0, 0
+    };
+    int sampling_frequency_index = 15; // デフォルト値
+    for (int i = 0; i < 13; i++) {
+        if (sampling_rates[i] == codecpar->sample_rate) {
+            sampling_frequency_index = i;
+            break;
+        }
+    }
+
+    // チャンネル設定
+    int channel_configuration = codecpar->ch_layout.nb_channels;
+    if (channel_configuration > 7) channel_configuration = 0;
+
+    // プロファイル（AAC-LC = 1）
+    int profile = 1; // AAC-LC
+    if (codecpar->profile != FF_PROFILE_UNKNOWN) {
+        profile = codecpar->profile + 1;
+    }
+
+    // フレーム長（ADTSヘッダー7バイト + AACデータ）
+    int frame_length = 7 + pkt->size;
+
+    // ADTSヘッダー（7バイト、CRCなし）を生成
+    uint8_t adts_header[7];
+
+    // Syncword (12 bits): 0xFFF
+    adts_header[0] = 0xFF;
+    adts_header[1] = 0xF0;
+
+    // MPEG version (1 bit): 0 = MPEG-4
+    // Layer (2 bits): 00
+    // Protection absent (1 bit): 1 (no CRC)
+    adts_header[1] |= 0x01; // protection_absent = 1
+
+    // Profile (2 bits)
+    adts_header[2] = ((profile & 0x03) << 6);
+
+    // Sampling frequency index (4 bits)
+    adts_header[2] |= ((sampling_frequency_index & 0x0F) << 2);
+
+    // Private bit (1 bit): 0
+    // Channel configuration (3 bits) - upper 1 bit
+    adts_header[2] |= ((channel_configuration & 0x04) >> 2);
+
+    // Channel configuration (3 bits) - lower 2 bits
+    adts_header[3] = ((channel_configuration & 0x03) << 6);
+
+    // Original/Copy (1 bit): 0
+    // Home (1 bit): 0
+    // Copyright identification bit (1 bit): 0
+    // Copyright identification start (1 bit): 0
+    // Frame length (13 bits) - upper 2 bits
+    adts_header[3] |= ((frame_length & 0x1800) >> 11);
+
+    // Frame length (13 bits) - middle 8 bits
+    adts_header[4] = ((frame_length & 0x7F8) >> 3);
+
+    // Frame length (13 bits) - lower 3 bits
+    adts_header[5] = ((frame_length & 0x07) << 5);
+
+    // Buffer fullness (11 bits) - 0x7FF for VBR
+    adts_header[5] |= 0x1F;
+    adts_header[6] = 0xFC;
+
+    // Number of AAC frames (2 bits): 0 (one AAC frame per ADTS frame)
+    // adts_header[6] already has correct value
+
+    // ADTSヘッダーとAACデータをoutputに追加
+    output.insert(output.end(), adts_header, adts_header + 7);
+    output.insert(output.end(), pkt->data, pkt->data + pkt->size);
+
+    return true;
 }
 
 bool TSReplace::isFirstNalAud(const bool isHEVC, const uint8_t *ptr, const size_t size) {
@@ -1656,6 +1911,86 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
     return RGY_ERR_NONE;
 }
 
+RGY_ERR TSReplace::writeReplacedAudio(AVPacket *avpkt, const uint8_t audStreamID, const uint16_t audPID, uint8_t& counter, const int64_t firstKeyPts, const AVRational& timebase, const int64_t firstTimestamp, const AVCodecParameters *codecpar) {
+    if (!avpkt || avpkt->size <= 0) {
+        return RGY_ERR_INVALID_PARAM;
+    }
+
+    // ADTSヘッダーを追加したデータを準備
+    std::vector<uint8_t> audioData;
+    audioData.reserve(avpkt->size + 7);  // 最大7バイトのADTSヘッダー
+    addADTSHeader(audioData, avpkt, codecpar);
+
+    // PTS/DTS変換 (元のtimebaseからTS timebase 90kHzへ)
+    const auto pts = av_rescale_q(avpkt->pts - firstKeyPts, timebase, av_make_q(1, TS_TIMEBASE)) + firstTimestamp;
+    const auto dts = av_rescale_q(avpkt->dts - firstKeyPts, timebase, av_make_q(1, TS_TIMEBASE)) + firstTimestamp;
+    const bool addDts = (avpkt->pts != avpkt->dts);
+
+    // TSパケット分割ループ
+    RGYTSPacket pkt;
+    pkt.packet.reserve(188);
+
+    for (int i = 0; i < (int)audioData.size(); ) {
+        // 最初のパケットのみPESヘッダーが必要
+        const int pes_header_len = (i > 0) ? 0 : (14 + (addDts ? 5 : 0));
+        int len = std::min(184, (int)audioData.size() + pes_header_len - i);
+
+        counter = (counter + 1) & 0x0f;
+
+        pkt.packet.clear();
+        // TSパケットヘッダー (4 bytes)
+        pkt.packet.push_back(0x47);  // sync byte
+        pkt.packet.push_back((i == 0 ? 0x40 : 0) | (uint8_t)(audPID >> 8));  // PUSI + PID high
+        pkt.packet.push_back((uint8_t)(audPID & 0xff));  // PID low
+        pkt.packet.push_back((len < 184 ? 0x30 : 0x10) | counter);  // adaptation + counter
+
+        // Adaptation field (パディングが必要な場合)
+        if (len < 184) {
+            pkt.packet.push_back((uint8_t)(183 - len));  // adaptation field length
+            if (len < 183) {
+                pkt.packet.push_back(0x00);  // flags (音声用は0x00)
+                pkt.packet.insert(pkt.packet.end(), 182 - len, 0xff);  // stuffing bytes
+            }
+        }
+
+        // PESヘッダー (最初のパケットのみ)
+        if (pes_header_len > 0) {
+            static uint8_t PES_START_CODE[3] = { 0x00, 0x00, 0x01 };
+            pkt.packet.insert(pkt.packet.end(), PES_START_CODE, PES_START_CODE + sizeof(PES_START_CODE));
+            pkt.packet.push_back(audStreamID);  // stream id (0xc0 or 0xc1)
+
+            // PES packet length (音声は0 = unbounded)
+            pkt.packet.push_back(0);
+            pkt.packet.push_back(0);
+
+            // PES flags
+            pkt.packet.push_back(0x80);  // '10' marker bits
+            pkt.packet.push_back(addDts ? (0x80 | 0x40) : 0x80);  // PTS flag (and DTS flag if needed)
+            pkt.packet.push_back(addDts ? 10 : 5);  // PES header data length
+
+            // PTS (and DTS if needed)
+            if (addDts) {
+                pushPESPTS(pkt.packet, pts, 0x30);  // PTS with marker '0011'
+                pushPESPTS(pkt.packet, dts, 0x10);  // DTS with marker '0001'
+            } else {
+                pushPESPTS(pkt.packet, pts, 0x20);  // PTS only with marker '0010'
+            }
+        }
+
+        // 音声ペイロード
+        pkt.packet.insert(pkt.packet.end(), audioData.data() + i, audioData.data() + i + len - pes_header_len);
+        i += (len - pes_header_len);
+
+        // 188 bytesにパディング
+        while (pkt.packet.size() < 188) {
+            pkt.packet.push_back(0xff);
+        }
+
+        writePacket(&pkt);
+    }
+    return RGY_ERR_NONE;
+}
+
 int64_t TSReplace::getOrigPtsOffset() {
     if (m_vidDTS < m_vidDTSOutMax) {
         if (m_vidDTSOutMax - m_vidDTS > WRAP_AROUND_CHECK_VALUE) {
@@ -1719,11 +2054,99 @@ RGY_ERR TSReplace::writeReplacedVideo() {
     return RGY_ERR_NONE;
 }
 
+RGY_ERR TSReplace::writeReplacedAudio() {
+    if (!m_audioReplace || m_audPIDReplace == 0 || m_vidFirstTimestamp == TIMESTAMP_INVALID_VALUE) {
+        return RGY_ERR_NONE;
+    }
+
+    const auto dtsOrigOffset = getOrigPtsOffset();
+    static int audio_pkt_count = 0;
+
+    for (;;) {
+        auto [err, pts, dts] = m_audioReplace->getFrontPktPtsDts();
+        if (err != RGY_ERR_NONE) {
+            return err;
+        }
+
+        // 音声オフセットをdtsベースで計算
+        const auto dtsAudOffset = av_rescale_q(dts - m_audioReplace->getFirstKeyPts(),
+                                                m_audioReplace->getVidTimebase(),
+                                                av_make_q(1, TS_TIMEBASE));
+
+        // 音声が元ストリームに追いついているかチェック
+        if (dtsOrigOffset < dtsAudOffset) {
+            break;
+        }
+
+        auto [err2, pkt] = m_audioReplace->getFrontPktAndPop();
+        if (err2 != RGY_ERR_NONE) {
+            return err2;
+        }
+
+        audio_pkt_count++;
+        if (audio_pkt_count <= 5 || audio_pkt_count % 100 == 0) {
+            AddMessage(RGY_LOG_DEBUG, _T("Audio packet %d: PTS=%lld, DTS=%lld, size=%d, origOffset=%lld, audOffset=%lld\n"),
+                       audio_pkt_count, (long long)pts, (long long)dts, pkt->size, (long long)dtsOrigOffset, (long long)dtsAudOffset);
+        }
+
+        err = writeReplacedAudio(pkt.get(), m_audioReplace->getAudioStreamID(), m_audPIDReplace, m_audCounter,
+                                  m_audioReplace->getFirstKeyPts(),
+                                  m_audioReplace->getVidTimebase(),
+                                  m_vidFirstTimestamp,
+                                  m_audioReplace->getVidCodecPar());
+        if (err != RGY_ERR_NONE) {
+            return err;
+        }
+    }
+    return RGY_ERR_NONE;
+}
+
+RGY_ERR TSReplace::writeReplacedAudio1() {
+    if (!m_audio1Replace || m_aud1PIDReplace == 0 || m_vidFirstTimestamp == TIMESTAMP_INVALID_VALUE) {
+        return RGY_ERR_NONE;
+    }
+
+    const auto dtsOrigOffset = getOrigPtsOffset();
+
+    for (;;) {
+        auto [err, pts, dts] = m_audio1Replace->getFrontPktPtsDts();
+        if (err != RGY_ERR_NONE) {
+            return err;
+        }
+
+        const auto dtsAud1Offset = av_rescale_q(dts - m_audio1Replace->getFirstKeyPts(),
+                                                 m_audio1Replace->getVidTimebase(),
+                                                 av_make_q(1, TS_TIMEBASE));
+
+        if (dtsOrigOffset < dtsAud1Offset) {
+            break;
+        }
+
+        auto [err2, pkt] = m_audio1Replace->getFrontPktAndPop();
+        if (err2 != RGY_ERR_NONE) {
+            return err2;
+        }
+
+        err = writeReplacedAudio(pkt.get(), m_audio1Replace->getAudioStreamID(1), m_aud1PIDReplace, m_aud1Counter,
+                                  m_audio1Replace->getFirstKeyPts(),
+                                  m_audio1Replace->getVidTimebase(),
+                                  m_vidFirstTimestamp,
+                                  m_audio1Replace->getVidCodecPar());
+        if (err != RGY_ERR_NONE) {
+            return err;
+        }
+    }
+    return RGY_ERR_NONE;
+}
+
 int64_t TSReplace::getStartPointPTS() const {
     switch (m_startPoint) {
     case TSRReplaceStartPoint::FirstPacket:    return m_vidFirstPacketPTS + m_replaceDelay;
     case TSRReplaceStartPoint::FirstFrame:     return m_vidFirstFramePTS + m_replaceDelay;
     case TSRReplaceStartPoint::KeyframPts:     return m_vidFirstKeyPTS + m_replaceDelay;
+    case TSRReplaceStartPoint::Auto:
+    default:
+        break;
     }
     return TIMESTAMP_INVALID_VALUE;
 }
@@ -1775,6 +2198,16 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
 
     m_vidPIDReplace = service->vid.stream.pid;
     AddMessage(RGY_LOG_INFO, _T("Target service ID %d, replace vid pid: 0x%04x (%d).\n"), service->programNumber, m_vidPIDReplace, m_vidPIDReplace);
+
+    // 音声PIDの保存
+    if (m_audioReplace && service->aud0.stream.pid > 0) {
+        m_audPIDReplace = service->aud0.stream.pid;
+        AddMessage(RGY_LOG_INFO, _T("Target audio0 replace pid: 0x%04x (%d).\n"), m_audPIDReplace, m_audPIDReplace);
+    }
+    if (m_audio1Replace && service->aud1.stream.pid > 0) {
+        m_aud1PIDReplace = service->aud1.stream.pid;
+        AddMessage(RGY_LOG_INFO, _T("Target audio1 replace pid: 0x%04x (%d).\n"), m_aud1PIDReplace, m_aud1PIDReplace);
+    }
 
     if (service->pidPcr == service->vid.stream.pid) {
         // PCRが映像のストリームに含まれる場合は、別PIDで独立したPCRパケットを生成する
@@ -2027,10 +2460,22 @@ RGY_ERR TSReplace::restruct() {
                     if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                         return err;
                     }
+                    if (auto err = writeReplacedAudio(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                        return err;
+                    }
+                    if (auto err = writeReplacedAudio1(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                        return err;
+                    }
                 } else {
                     auto pmt_pid = m_demuxer->selectServiceID();
                     if (pmt_pid && tspkt->header.PID == pmt_pid->pmt_pid) { // PMT
                         if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                            return err;
+                        }
+                        if (auto err = writeReplacedAudio(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                            return err;
+                        }
+                        if (auto err = writeReplacedAudio1(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                             return err;
                         }
                     }
@@ -2127,6 +2572,12 @@ RGY_ERR TSReplace::restruct() {
                             if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                                 return err;
                             }
+                            if (auto err = writeReplacedAudio(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                                return err;
+                            }
+                            if (auto err = writeReplacedAudio1(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                                return err;
+                            }
                         }
                         if (m_pcrPIDReplace) {
                             writeReplacedPCR(ret.pcr);
@@ -2164,6 +2615,15 @@ RGY_ERR TSReplace::restruct() {
                             // データ放送の削除 -> 出力しない
                         } else {
                             bool outputPkt = true;
+
+                            // 元の音声パケットをスキップ（置き換えが有効な場合）
+                            if (m_audioReplace && m_audPIDReplace > 0 && ret.stream.pid == m_audPIDReplace) {
+                                outputPkt = false;
+                            }
+                            if (m_audio1Replace && m_aud1PIDReplace > 0 && ret.stream.pid == m_aud1PIDReplace) {
+                                outputPkt = false;
+                            }
+
                             if (m_replaceDelay > 0 && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
                                 if (std::find(replaceDelayOutputAudioPid.begin(), replaceDelayOutputAudioPid.end(), ret.stream.pid) == replaceDelayOutputAudioPid.end()) {
                                     // まだ出力を開始していない音声
@@ -2222,6 +2682,8 @@ static void show_help() {
         _T("-o,--output <filename>          set output ts filename\n")
         _T("-i,--input <filename>           set input ts filename\n")
         _T("-r,--replace <filename>         set input video filename\n")
+        _T("   --replace-av,-av <filename>  set input file with video and audio\n")
+        _T("                                 (auto-detect all audio streams)\n")
         _T("-e,--encoder <encoder path> <encoder args>\n")
         _T("         can be used instead of \"-r\"\n")
         _T("         args after \"--encoder\" will be passed to encoder\n")
@@ -2366,6 +2828,11 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
     if (IS_OPTION("replace")) {
         i++;
         prm.replacefile = strInput[i];
+        return 0;
+    }
+    if (IS_OPTION("replace-av") || IS_OPTION("av")) {
+        i++;
+        prm.replaceav = strInput[i];
         return 0;
     }
     if (IS_OPTION("output")) {
@@ -2540,6 +3007,8 @@ int _tmain(const int argc, const TCHAR **argv) {
                 option_name = &argv[i][2];
             } else if (argv[i][2] == _T('\0')) {
                 option_name = cmd_short_opt_to_long(argv[i][1]);
+            } else if (_tcscmp(&argv[i][1], _T("av")) == 0) {
+                option_name = _T("replace-av");
             }
         }
 
@@ -2586,6 +3055,8 @@ int _tmain(const int argc, const TCHAR **argv) {
                     _ftprintf(stderr, _T("Unknown option: \"%s\""), strInput[i]);
                     return 1;
                 }
+            } else if (_tcscmp(&strInput[i][1], _T("av")) == 0) {
+                option_name = _T("replace-av");
             }
         }
 
@@ -2606,12 +3077,16 @@ int _tmain(const int argc, const TCHAR **argv) {
         _ftprintf(stderr, _T("ERROR: input file not set.\n"));
         return 1;
     }
-    if (prm.replacefile.size() == 0 && prm.encoderPath.size() == 0) {
+    if (prm.replacefile.size() == 0 && prm.replaceav.size() == 0 && prm.encoderPath.size() == 0) {
         _ftprintf(stderr, _T("ERROR: replace video file or encoder path not set.\n"));
         return 1;
     }
     if (prm.replacefile.size() > 0 && prm.encoderPath.size() > 0) {
         _ftprintf(stderr, _T("ERROR: -r/--replace and --encoder cannot be used at the same time.\n"));
+        return 1;
+    }
+    if (prm.replaceav.size() > 0 && (prm.replacefile.size() > 0 || prm.encoderPath.size() > 0)) {
+        _ftprintf(stderr, _T("ERROR: --av/--replace-av cannot be used with -r/--replace or --encoder.\n"));
         return 1;
     }
     if (prm.output.size() == 0) {

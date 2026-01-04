@@ -230,16 +230,23 @@ if ! cxx_check "" ; then
 fi
 cnf_write "OK"
 
-if [ `echo | ${CXX} -E -dM - | egrep "WIN32|WIN64" | wc --lines` -ne 0 ]; then
+if [ `echo | ${CXX} -E -dM - | egrep "^#define _(WIN32|WIN64) " | wc -l` -ne 0 ]; then
     cnf_write "This script does not support Windows platform."
     cnf_write "For Windows, use Visual Studio."
-    exit 1 
+    exit 1
 fi
 
-if [ `echo | ${CXX} -E -dM - | grep "__ARM_ARCH_ISA_A64" | wc --lines` -ne 0 ]; then
+# Check for macOS
+if [ `echo | ${CXX} -E -dM - | grep "__APPLE__" | wc -l` -ne 0 ]; then
+    IS_MACOS=1
+else
+    IS_MACOS=0
+fi
+
+if [ `echo | ${CXX} -E -dM - | grep "__ARM_ARCH_ISA_A64" | wc -l` -ne 0 ]; then
     ARM64=1
     X86_64=0
-elif [ `echo | ${CXX} -E -dM - | grep "x86_64" | wc --lines` -ne 0 ]; then
+elif [ `echo | ${CXX} -E -dM - | grep "x86_64" | wc -l` -ne 0 ]; then
     ARM64=0
     X86_64=1
 else
@@ -253,7 +260,12 @@ CXXFLAGS="-Wall -Wno-missing-braces -Wno-unknown-pragmas -Wno-unused \
 -DLINUX -DUNIX -D_FILE_OFFSET_BITS=64 -D__USE_LARGEFILE64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS \
 -I${SRCDIR} -I${SRCDIR}/app \
 "
-LDFLAGS="-L. -ldl -lm -lstdc++ -lstdc++fs"
+# Set LDFLAGS based on platform
+if [ $IS_MACOS -ne 0 ]; then
+    LDFLAGS="-L. -lm -lstdc++ -liconv"
+else
+    LDFLAGS="-L. -ldl -lm -lstdc++ -lstdc++fs"
+fi
 if [ $ARM64 -ne 0 ]; then
     CXXINC="${CXXINC} -DLINUX64"
 elif [ $X86_64 -ne 0 ]; then
@@ -464,7 +476,7 @@ if [ $X86_64 -ne 0 ]; then
     done
 fi
 
-ENCODER_REV=`git rev-list HEAD | wc --lines`
+ENCODER_REV=`git rev-list HEAD | wc -l`
 
 cnf_write ""
 cnf_write "Creating config.mak, rgy_config.h..."
