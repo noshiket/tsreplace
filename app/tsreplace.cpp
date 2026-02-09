@@ -1609,13 +1609,25 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back(0x01);
             buf.push_back(0x00);
         } else if (m_audioReplace && esPid == m_audPIDReplace) {
-            // 第1音声の置き換え
+            // 第1音声の置き換え: ビデオと同様にディスクリプタを再生成
             buf.push_back((uint8_t)m_audioReplace->getAudioStreamType());     // stream typeの上書き
-            buf.insert(buf.end(), table + pos + 1, table + pos + 5 + esInfoLength);
+            buf.push_back((uint8_t)((m_audPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
+            buf.push_back((uint8_t) (m_audPIDReplace & 0x00ff));
+            buf.push_back(0xf0);
+            buf.push_back(0x03);
+            buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
+            buf.push_back(0x01);
+            buf.push_back(0x10); // component_tag 0x10 = 第1音声
         } else if (m_audio1Replace && esPid == m_aud1PIDReplace) {
-            // 第2音声の置き換え
+            // 第2音声の置き換え: ビデオと同様にディスクリプタを再生成
             buf.push_back((uint8_t)m_audio1Replace->getAudioStreamType());    // stream typeの上書き
-            buf.insert(buf.end(), table + pos + 1, table + pos + 5 + esInfoLength);
+            buf.push_back((uint8_t)((m_aud1PIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
+            buf.push_back((uint8_t) (m_aud1PIDReplace & 0x00ff));
+            buf.push_back(0xf0);
+            buf.push_back(0x03);
+            buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
+            buf.push_back(0x01);
+            buf.push_back(0x30); // component_tag 0x30 = 第2音声
         } else if (m_removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
         } else {
@@ -1704,7 +1716,7 @@ bool TSReplace::addADTSHeader(std::vector<uint8_t>& output, const AVPacket *pkt,
     // プロファイル（AAC-LC = 1）
     int profile = 1; // AAC-LC
     if (codecpar->profile != FF_PROFILE_UNKNOWN) {
-        profile = codecpar->profile + 1;
+        profile = codecpar->profile; // FFmpegとADTSのプロファイル値は同じ（+1不要）
     }
 
     // フレーム長（ADTSヘッダー7バイト + AACデータ）
@@ -1717,9 +1729,10 @@ bool TSReplace::addADTSHeader(std::vector<uint8_t>& output, const AVPacket *pkt,
     adts_header[0] = 0xFF;
     adts_header[1] = 0xF0;
 
-    // MPEG version (1 bit): 0 = MPEG-4
+    // MPEG version (1 bit): 0 = MPEG-4（MP4からのAACペイロードと整合性を保つ）
     // Layer (2 bits): 00
     // Protection absent (1 bit): 1 (no CRC)
+    // adts_header[1] |= 0x08; // MPEG version: MPEG-4なのでビットは立てない
     adts_header[1] |= 0x01; // protection_absent = 1
 
     // Profile (2 bits)
@@ -1916,10 +1929,13 @@ RGY_ERR TSReplace::writeReplacedAudio(AVPacket *avpkt, const uint8_t audStreamID
         return RGY_ERR_INVALID_PARAM;
     }
 
-    // ADTSヘッダーを追加したデータを準備
+    // AAC音声にはADTSヘッダーを追加（MPEG-2 TS標準に準拠）
     std::vector<uint8_t> audioData;
-    audioData.reserve(avpkt->size + 7);  // 最大7バイトのADTSヘッダー
-    addADTSHeader(audioData, avpkt, codecpar);
+    audioData.reserve(avpkt->size + 7);  // ADTS header (7 bytes) + AAC data
+    if (!addADTSHeader(audioData, avpkt, codecpar)) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to add ADTS header to audio packet\n"));
+        return RGY_ERR_INVALID_FORMAT;
+    }
 
     // PTS/DTS変換 (元のtimebaseからTS timebase 90kHzへ)
     const auto pts = av_rescale_q(avpkt->pts - firstKeyPts, timebase, av_make_q(1, TS_TIMEBASE)) + firstTimestamp;
@@ -1959,9 +1975,10 @@ RGY_ERR TSReplace::writeReplacedAudio(AVPacket *avpkt, const uint8_t audStreamID
             pkt.packet.insert(pkt.packet.end(), PES_START_CODE, PES_START_CODE + sizeof(PES_START_CODE));
             pkt.packet.push_back(audStreamID);  // stream id (0xc0 or 0xc1)
 
-            // PES packet length (音声は0 = unbounded)
-            pkt.packet.push_back(0);
-            pkt.packet.push_back(0);
+            // PES packet length: ペイロード + PESヘッダーデータ (3 + header_data_len)
+            const uint16_t pesPayloadLen = (uint16_t)(audioData.size() + 3 + (addDts ? 10 : 5));
+            pkt.packet.push_back((uint8_t)(pesPayloadLen >> 8));
+            pkt.packet.push_back((uint8_t)(pesPayloadLen & 0xff));
 
             // PES flags
             pkt.packet.push_back(0x80);  // '10' marker bits
