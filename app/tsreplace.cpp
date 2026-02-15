@@ -1609,7 +1609,7 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back(0x01);
             buf.push_back(0x00);
         } else if (m_audioReplace && esPid == m_audPIDReplace) {
-            // 第1音声の置き換え: ビデオと同様にディスクリプタを再生成
+            // 第1音声の置き換え: stream_type/PIDを上書き、component_tagは元のPMTから取得
             buf.push_back((uint8_t)m_audioReplace->getAudioStreamType());     // stream typeの上書き
             buf.push_back((uint8_t)((m_audPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
             buf.push_back((uint8_t) (m_audPIDReplace & 0x00ff));
@@ -1617,9 +1617,19 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back(0x03);
             buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
             buf.push_back(0x01);
-            buf.push_back(0x10); // component_tag 0x10 = 第1音声
+            { // 元のPMTのstream_identifier_descriptor(0x52)からcomponent_tagを取得、なければ0x10
+                uint8_t componentTag = 0x10;
+                const int esEnd = pos + 5 + esInfoLength;
+                for (int di = pos + 5; di + 2 <= esEnd && di + 2 + table[di + 1] <= esEnd; di += 2 + table[di + 1]) {
+                    if (table[di] == (uint8_t)RGYTSDescriptor::StreamIdentifier && table[di + 1] >= 1) {
+                        componentTag = table[di + 2];
+                        break;
+                    }
+                }
+                buf.push_back(componentTag);
+            }
         } else if (m_audio1Replace && esPid == m_aud1PIDReplace) {
-            // 第2音声の置き換え: ビデオと同様にディスクリプタを再生成
+            // 第2音声の置き換え: stream_type/PIDを上書き、component_tagは元のPMTから取得
             buf.push_back((uint8_t)m_audio1Replace->getAudioStreamType());    // stream typeの上書き
             buf.push_back((uint8_t)((m_aud1PIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
             buf.push_back((uint8_t) (m_aud1PIDReplace & 0x00ff));
@@ -1627,7 +1637,17 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back(0x03);
             buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
             buf.push_back(0x01);
-            buf.push_back(0x30); // component_tag 0x30 = 第2音声
+            { // 元のPMTのstream_identifier_descriptor(0x52)からcomponent_tagを取得、なければ0x30
+                uint8_t componentTag = 0x30;
+                const int esEnd = pos + 5 + esInfoLength;
+                for (int di = pos + 5; di + 2 <= esEnd && di + 2 + table[di + 1] <= esEnd; di += 2 + table[di + 1]) {
+                    if (table[di] == (uint8_t)RGYTSDescriptor::StreamIdentifier && table[di + 1] >= 1) {
+                        componentTag = table[di + 2];
+                        break;
+                    }
+                }
+                buf.push_back(componentTag);
+            }
         } else if (m_removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
         } else {
